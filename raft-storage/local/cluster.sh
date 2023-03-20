@@ -354,8 +354,17 @@ function create_config {
 
   rm -f config-vault_1.hcl
 
+  if [ ! -d "$demo_home/vault_1" ] ; then
+    printf "\n%s" \
+      "Create vault_1 storage" \
+      ""
+
+    mkdir -pm 0755 "$demo_home/vault_1"
+  fi
   tee "$demo_home"/config-vault_1.hcl 1> /dev/null <<EOF
-storage "inmem" {}
+storage "file" {
+   path = "$demo_home/vault_1/data"
+}
 
 listener "tcp" {
    address = "127.0.0.1:8200"
@@ -622,6 +631,94 @@ function setup {
   esac
 }
 
+function backup {
+  local vault_leader=$(vault_2 operator raft list-peers -format=json)
+  local vault_node_name=$(echo $vault_leader | jq -r '.data.config.servers[] | select(.leader==true) | .node_id')
+  local backup_name=$(date +"%Y%m%d%H%M%S")
+  $vault_node_name operator raft snapshot save "$backup_name-$vault_node_name.snapshot"
+  # mv "$backup_name-$vault_node_name.snapshot" backup/
+}
+
+function recovery_mode_vault_2 {
+  VAULT_TOKEN=$(cat root_token-vault_1) VAULT_ADDR=http://127.0.0.2:8200 vault server -recovery -config=config-vault_2.hcl
+}
+
+function recovery_mode_vault_3 {
+  VAULT_TOKEN=$(cat root_token-vault_1) VAULT_ADDR=http://127.0.0.3:8200 vault server -recovery -config=config-vault_3.hcl
+}
+
+function recovery_mode_vault_4 {
+  VAULT_TOKEN=$(cat root_token-vault_1) VAULT_ADDR=http://127.0.0.4:8200 vault server -recovery -config=config-vault_4.hcl
+}
+
+function recovery_mode {
+  case "$1" in
+    vault_2)
+      shift ;
+      recovery_mode_vault_2
+      ;;
+    vault_3)
+      shift ;
+      recovery_mode_vault_3
+      ;;
+    vault_4)
+      shift ;
+      recovery_mode_vault_4
+      ;;
+    *)
+      printf "\n%s" \
+      "Puts vault into recovery mode" \
+      "Usage: $script_name recovery_mode [vault_2|vault_3|vault_4]" \
+      ""
+      ;;
+  esac
+}
+
+function configure_recovery {
+  case "$1" in
+    vault_2)
+      export VAULT_ADDR="http://127.0.0.2:8200"
+      ;;
+    vault_3)
+      export VAULT_ADDR="http://127.0.0.3:8200"
+      ;;
+    vault_4)
+      export VAULT_ADDR="http://127.0.0.4:8200"
+      ;;
+    *)
+      printf "\n%s" \
+      "Sets VAULT_ADDR for recovery mode" \
+      ""
+      ;;
+  esac
+
+  local OTP=$(vault operator generate-root -generate-otp -recovery-token)
+  local NONCE_OUT=$(vault operator generate-root -init -otp=$OTP -recovery-token -format=json)
+  # echo "$NONCE_OUT"
+  local NONCE=$(echo "$NONCE_OUT" | jq -r ".nonce")
+  local RECOVERY_KEY=$(cat recovery_key-vault_2)
+
+  echo "$OTP" > c_otp-$1
+  echo "$NONCE" > c_nonce-$1
+
+  local ENCODED_TOKEN_OUT=$(cat ./recovery_key-vault_2 | vault operator generate-root -nonce $NONCE -format=json -recovery-token -)
+  # echo "$ENCODED_TOKEN_OUT"
+  local ENCODED_TOKEN=$(echo "$ENCODED_TOKEN_OUT" | jq -r ".encoded_token")
+  echo "$ENCODED_TOKEN" > c_encoded_token-$1
+
+  local RECOVERY_TOKEN=$(vault operator generate-root \
+    -decode=$ENCODED_TOKEN \
+    -otp=$OTP \
+    -recovery-token)
+  
+  echo "$RECOVERY_TOKEN" > c_recovery_token-$1
+  VAULT_TOKEN=$RECOVERY_TOKEN vault list sys/raw/sys
+
+  printf "\n%s" \
+    "Recovery Success" \
+    ""
+}
+
 case "$1" in
   create)
     shift ;
@@ -661,6 +758,17 @@ case "$1" in
   clean)
     stop all
     clean
+    ;;
+  backup)
+    backup
+    ;;
+  recovery_mode)
+    shift ;
+    recovery_mode "$@"
+    ;;
+  configure_recovery)
+    shift ;
+    configure_recovery "$@"
     ;;
   *)
     printf "\n%s" \
